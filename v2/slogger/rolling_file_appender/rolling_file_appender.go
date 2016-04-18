@@ -1,4 +1,4 @@
-// Copyright 2013 MongoDB, Inc.
+// Copyright 2013, 2014 MongoDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,22 +19,25 @@ package rolling_file_appender
 
 import (
 	"fmt"
-	"github.com/tolsen/slogger/v2"
+	"github.com/tolsen/slogger/v2/slogger"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
+	"sync"
 	"time"
 )
 
 type RollingFileAppender struct {
-	MaxFileSize     int64
-	MaxRotatedLogs  int
-	file            *os.File
-	absPath         string
-	curFileSize     int64
-	headerGenerator func() []string
+	MaxFileSize          int64
+	MaxRotatedLogs       int
+	file                 *os.File
+	absPath              string
+	curFileSize          int64
+	headerGenerator      func() []string
+	stringWriterCallback func(*os.File) slogger.StringWriter
+	lock                 sync.Mutex
 }
 
 // New creates a new RollingFileAppender.  filename is path to the
@@ -49,23 +52,33 @@ type RollingFileAppender struct {
 // rotated logs allowed before old logs are deleted.  If
 // rotateIfExists is set to true and a log file with the same filename
 // already exists, then the current one will be rotated.  If
-// rotateIfExists is set to true and a log file with the same filename
-// already exists, then the current log file will be appended to.  If
-// a log file with the same filename does not exist, then a new log
-// file is created regardless of the value of rotateIfExists.  As
-// RotatingFileAppender is asynchronous, an errHandler can be provided
-// that will be called when an error occurs.  It can set to nil if you
-// do not want to provide one.  The return value headerGenerator, if
-// not nil, is logged at the beginning of every log file.
+// rotateIfExists is set to false and a log file with the same
+// filename already exists, then the current log file will be appended
+// to.  If a log file with the same filename does not exist, then a
+// new log file is created regardless of the value of rotateIfExists.
+// As RotatingFileAppender might be wrapped by an AsyncAppender, an
+// errHandler can be provided that will be called when an error
+// occurs.  It can set to nil if you do not want to provide one.  The
+// return value headerGenerator, if not nil, is logged at the
+// beginning of every log file.
 //
 // Note that after creating a RollingFileAppender with New(), you will
 // probably want to defer a call to RollingFileAppender's Close() (or
 // at least Flush()).  This ensures that in case of program exit
 // (normal or panicking) that any pending logs are logged.
 func New(filename string, maxFileSize int64, maxRotatedLogs int, rotateIfExists bool, headerGenerator func() []string) (*RollingFileAppender, error) {
+	return NewWithStringWriter(filename, maxFileSize, maxRotatedLogs, rotateIfExists, headerGenerator, nil)
+}
+
+func NewWithStringWriter(filename string, maxFileSize int64, maxRotatedLogs int, rotateIfExists bool, headerGenerator func() []string, stringWriterCallback func(*os.File) slogger.StringWriter) (*RollingFileAppender, error) {
 	if headerGenerator == nil {
 		headerGenerator = func() []string {
 			return []string{}
+		}
+	}
+	if stringWriterCallback == nil {
+		stringWriterCallback = func(f *os.File) slogger.StringWriter {
+			return f
 		}
 	}
 
@@ -75,10 +88,11 @@ func New(filename string, maxFileSize int64, maxRotatedLogs int, rotateIfExists 
 	}
 
 	appender := &RollingFileAppender{
-		MaxFileSize:     maxFileSize,
-		MaxRotatedLogs:  maxRotatedLogs,
-		absPath:         absPath,
-		headerGenerator: headerGenerator,
+		MaxFileSize:          maxFileSize,
+		MaxRotatedLogs:       maxRotatedLogs,
+		absPath:              absPath,
+		headerGenerator:      headerGenerator,
+		stringWriterCallback: stringWriterCallback,
 	}
 
 	fileInfo, err := os.Stat(absPath)
@@ -104,6 +118,8 @@ func New(filename string, maxFileSize int64, maxRotatedLogs int, rotateIfExists 
 }
 
 func (self *RollingFileAppender) Append(log *slogger.Log) error {
+	self.lock.Lock()
+	defer self.lock.Unlock()
 	n, err := self.appendSansSizeTracking(log)
 	self.curFileSize += int64(n)
 
@@ -155,7 +171,7 @@ func (self *RollingFileAppender) appendSansSizeTracking(log *slogger.Log) (bytes
 	}
 
 	msg := slogger.FormatLog(log)
-	bytesWritten, err = self.file.WriteString(msg)
+	bytesWritten, err = self.stringWriterCallback(self.file).WriteString(msg)
 
 	if err != nil {
 		err = WriteError{self.absPath, err}
@@ -244,11 +260,6 @@ func (self *RollingFileAppender) renameLogFile(oldFilename string) error {
 }
 
 func (self *RollingFileAppender) rotate() error {
-	// rename old log
-	if err := self.renameLogFile(self.absPath); err != nil {
-		return err
-	}
-
 	// close current log if we have one open
 	if self.file != nil {
 		if err := self.file.Close(); err != nil {
@@ -256,6 +267,11 @@ func (self *RollingFileAppender) rotate() error {
 		}
 	}
 	self.curFileSize = 0
+
+	// rename old log
+	if err := self.renameLogFile(self.absPath); err != nil {
+		return err
+	}
 
 	// create new log
 	file, err := os.Create(self.absPath)
@@ -432,7 +448,7 @@ func extractRotationTimeFromFilename(filename string) (*RotationTime, error) {
 		)
 	}
 
-	var serial int
+	serial := 0
 	if match[3] != "" {
 		serial, err = strconv.Atoi(match[3])
 

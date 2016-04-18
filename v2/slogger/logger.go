@@ -1,4 +1,4 @@
-// Copyright 2013, 2014 MongoDB, Inc.
+// Copyright 2013 - 2016 MongoDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@ package slogger
 import (
 	"errors"
 	"fmt"
-	"github.com/tolsen/slogger/v2/queued_set"
+	"os"
 	"runtime"
 	"strings"
 	"time"
@@ -26,6 +26,7 @@ import (
 type Log struct {
 	Prefix     string
 	Level      Level
+	ErrorCode  ErrorCode
 	Filename   string
 	FuncName   string
 	Line       int
@@ -35,11 +36,11 @@ type Log struct {
 	Context    *Context
 }
 
-func SimpleLog(prefix string, level Level, callerSkip int, messageFmt string, args ...interface{}) *Log {
-	return SimpleLogStrippingDirs(prefix, level, callerSkip, -1, messageFmt, args...)
+func SimpleLog(prefix string, level Level, errorCode ErrorCode, callerSkip int, messageFmt string, args ...interface{}) *Log {
+	return SimpleLogStrippingDirs(prefix, level, errorCode, callerSkip, -1, messageFmt, args...)
 }
 
-func SimpleLogStrippingDirs(prefix string, level Level, callerSkip int, numDirsToKeep int, messageFmt string, args ...interface{}) *Log {
+func SimpleLogStrippingDirs(prefix string, level Level, errorCode ErrorCode, callerSkip int, numDirsToKeep int, messageFmt string, args ...interface{}) *Log {
 	pc, file, line, ok := runtime.Caller(callerSkip)
 	funcName := ""
 
@@ -57,6 +58,7 @@ func SimpleLogStrippingDirs(prefix string, level Level, callerSkip int, numDirsT
 	return &Log{
 		Prefix:     prefix,
 		Level:      level,
+		ErrorCode:  errorCode,
 		Filename:   file,
 		FuncName:   funcName,
 		Line:       line,
@@ -67,56 +69,30 @@ func SimpleLogStrippingDirs(prefix string, level Level, callerSkip int, numDirsT
 }
 
 func (self *Log) Message() string {
-	messageFmt := self.MessageFmt
-	if self.Context != nil {
-		messageFmt = self.Context.interpolateString(self.MessageFmt)
-	}
-
-	return fmt.Sprintf(messageFmt, self.Args...)
-}
-
-// for use as a cache key
-func (self *Log) stringWithoutTime() string {
-	return fmt.Sprintf(
-		"%s %v %s %s %d %s",
-		self.Prefix,
-		self.Level.Type(),
-		self.Filename,
-		self.FuncName,
-		self.Line,
-		self.Message(),
-	)
+	return fmt.Sprintf(self.MessageFmt, self.Args...)
 }
 
 type Logger struct {
-	Prefix             string
-	Appenders          []Appender
-	StripDirs          int
-	suppressionCache   *queued_set.QueuedSet
-	suppressionEnabled bool
+	Prefix       string
+	Appenders    []Appender
+	StripDirs    int
+	TurboFilters []TurboFilter
 }
 
 // Log a message and a level to a logger instance. This returns a
 // pointer to a Log and a slice of errors that were gathered from every
-// Appender (nil errors included).
+// Appender (nil errors included), or nil and an empty error slice if
+// any turbo filter condition was not satisfied causing an early exit.
 func (self *Logger) Logf(level Level, messageFmt string, args ...interface{}) (*Log, []error) {
-	return self.logf(level, messageFmt, nil, args...)
+	return self.logf(level, NoErrorCode, messageFmt, nil, args...)
 }
 
 func (self *Logger) LogfWithContext(level Level, messageFmt string, context *Context, args ...interface{}) (*Log, []error) {
-	return self.logf(level, messageFmt, context, args...)
+	return self.logf(level, NoErrorCode, messageFmt, context, args...)
 }
 
-func (self *Logger) DisableLogSuppression() {
-	self.suppressionEnabled = false
-	self.suppressionCache = nil
-	return
-}
-
-func (self *Logger) EnableLogSuppression(historyCapacity int) {
-	self.suppressionCache = queued_set.New(historyCapacity)
-	self.suppressionEnabled = true
-	return
+func (self *Logger) LogfWithErrorCodeAndContext(level Level, errorCode ErrorCode, messageFmt string, context *Context, args ...interface{}) (*Log, []error) {
+	return self.logf(level, errorCode, messageFmt, context, args...)
 }
 
 // Log and return a formatted error string.
@@ -127,13 +103,27 @@ func (self *Logger) EnableLogSuppression(historyCapacity int) {
 //         whatIsExpected, whatIsReturned)
 // }5
 //
+
+type ErrorWithCode struct {
+	ErrCode ErrorCode
+	Err     error
+}
+
+func (e ErrorWithCode) Error() string {
+	return e.Err.Error()
+}
+
 func (self *Logger) Errorf(level Level, messageFmt string, args ...interface{}) error {
 	return self.ErrorfWithContext(level, messageFmt, nil, args...)
 }
 
 func (self *Logger) ErrorfWithContext(level Level, messageFmt string, context *Context, args ...interface{}) error {
-	log, _ := self.logf(level, messageFmt, context, args...)
-	return errors.New(log.Message())
+	return self.ErrorfWithErrorCodeAndContext(level, NoErrorCode, messageFmt, context, args...)
+}
+
+func (self *Logger) ErrorfWithErrorCodeAndContext(level Level, errorCode ErrorCode, messageFmt string, context *Context, args ...interface{}) error {
+	log, _ := self.logf(level, errorCode, messageFmt, context, args...)
+	return ErrorWithCode{errorCode, errors.New(log.Message())}
 }
 
 func (self *Logger) Flush() (errors []error) {
@@ -145,10 +135,6 @@ func (self *Logger) Flush() (errors []error) {
 	return
 }
 
-func (self *Logger) IsSuppressionEnabled() bool {
-	return self.suppressionEnabled
-}
-
 // Stackf is designed to work in tandem with `NewStackError`. This
 // function is similar to `Logf`, but takes a `stackErr`
 // parameter. `stackErr` is expected to be of type StackError, but does
@@ -158,8 +144,12 @@ func (self *Logger) Stackf(level Level, stackErr error, messageFmt string, args 
 }
 
 func (self *Logger) StackfWithContext(level Level, stackErr error, messageFmt string, context *Context, args ...interface{}) (*Log, []error) {
+	return self.StackfWithErrorCodeAndContext(level, NoErrorCode, stackErr, messageFmt, context, args...)
+}
+
+func (self *Logger) StackfWithErrorCodeAndContext(level Level, errorCode ErrorCode, stackErr error, messageFmt string, context *Context, args ...interface{}) (*Log, []error) {
 	messageFmt = fmt.Sprintf("%v\n%v", messageFmt, stackErr.Error())
-	return self.logf(level, messageFmt, context, args...)
+	return self.logf(level, errorCode, messageFmt, context, args...)
 }
 
 var ignoredFileNames = []string{"logger.go"}
@@ -204,12 +194,16 @@ func nonSloggerCaller() (pc uintptr, file string, line int, ok bool) {
 	return 0, "", 0, false
 }
 
-// accepts a Context or *Context as the first element of args
-func (self *Logger) logf(level Level, messageFmt string, context *Context, args ...interface{}) (*Log, []error) {
+func (self *Logger) logf(level Level, errorCode ErrorCode, messageFmt string, context *Context, args ...interface{}) (*Log, []error) {
 	var errors []error
 
+	for _, filter := range self.TurboFilters {
+		if filter(level, messageFmt, args) == false {
+			return nil, errors
+		}
+	}
+
 	pc, file, line, ok := nonSloggerCaller()
-	//	_, file, line, ok := runtime.Caller(2+offset)
 	if ok == false {
 		return nil, []error{fmt.Errorf("Failed to find the calling method.")}
 	}
@@ -218,6 +212,7 @@ func (self *Logger) logf(level Level, messageFmt string, context *Context, args 
 	log := &Log{
 		Prefix:     self.Prefix,
 		Level:      level,
+		ErrorCode:  errorCode,
 		Filename:   file,
 		FuncName:   baseFuncNameForPC(pc),
 		Line:       line,
@@ -227,12 +222,10 @@ func (self *Logger) logf(level Level, messageFmt string, context *Context, args 
 		Context:    context,
 	}
 
-	if !self.suppressionEnabled || self.suppressionCache.Add(log.stringWithoutTime()) {
-		for _, appender := range self.Appenders {
-			if err := appender.Append(log); err != nil {
-				error := fmt.Errorf("Error appending. Appender: %T Error: %v", appender, err)
-				errors = append(errors, error)
-			}
+	for _, appender := range self.Appenders {
+		if err := appender.Append(log); err != nil {
+			error := fmt.Errorf("Error appending. Appender: %T Error: %v", appender, err)
+			errors = append(errors, error)
 		}
 	}
 
@@ -246,11 +239,10 @@ type Level uint8
 const (
 	OFF Level = iota
 	DEBUG
-	ROUTINE
 	INFO
 	WARN
 	ERROR
-	DOOM
+	FATAL
 	topLevel
 )
 
@@ -260,13 +252,12 @@ var levelToStr []string
 
 func init() {
 	strToLevel = map[string]Level{
-		"off":     OFF,
-		"debug":   DEBUG,
-		"routine": ROUTINE,
-		"info":    INFO,
-		"warn":    WARN,
-		"error":   ERROR,
-		"doom":    DOOM,
+		"off":   OFF,
+		"debug": DEBUG,
+		"info":  INFO,
+		"warn":  WARN,
+		"error": ERROR,
+		"fatal": FATAL,
 	}
 
 	levelToStr = make([]string, len(strToLevel))
@@ -297,6 +288,10 @@ func (self Level) Type() string {
 
 	return levelToStr[uint8(self)]
 }
+
+type ErrorCode uint8
+
+const NoErrorCode = 0
 
 func stacktrace() []string {
 	ret := make([]string, 0, 2)
@@ -330,12 +325,12 @@ func (self *StackError) Error() string {
 
 func stripDirectories(filepath string, toKeep int) string {
 	var idxCutoff int
-	if idxCutoff = strings.LastIndex(filepath, "/"); idxCutoff == -1 {
+	if idxCutoff = strings.LastIndex(filepath, string(os.PathSeparator)); idxCutoff == -1 {
 		return filepath
 	}
 
 	for dirToKeep := 0; dirToKeep < toKeep; dirToKeep++ {
-		switch idx := strings.LastIndex(filepath[:idxCutoff], "/"); idx {
+		switch idx := strings.LastIndex(filepath[:idxCutoff], string(os.PathSeparator)); idx {
 		case -1:
 			break
 		default:

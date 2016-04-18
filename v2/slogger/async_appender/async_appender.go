@@ -1,4 +1,4 @@
-// Copyright 2013 MongoDB, Inc.
+// Copyright 2013, 2015 MongoDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@
 
 package async_appender
 
-import "github.com/tolsen/slogger/v2"
+import "github.com/tolsen/slogger/v2/slogger"
 
 type AsyncAppender struct {
 	Appender   slogger.Appender
@@ -74,7 +74,7 @@ func (self *AsyncAppender) fullWarningLog() *slogger.Log {
 }
 
 func internalWarningLog(messageFmt string, args ...interface{}) *slogger.Log {
-	return slogger.SimpleLog("AsyncAppender", slogger.WARN, 3, messageFmt, args...)
+	return slogger.SimpleLog("AsyncAppender", slogger.WARN, slogger.NoErrorCode, 3, messageFmt, args...)
 }
 
 // listenForAppends consumes appendCh and flushCh.  It consumes Logs

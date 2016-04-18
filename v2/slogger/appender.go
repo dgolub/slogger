@@ -1,4 +1,4 @@
-// Copyright 2013, 2014 MongoDB, Inc.
+// Copyright 2013 - 2015 MongoDB, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -30,17 +30,28 @@ func FormatLog(log *Log) string {
 	hour, min, sec := log.Timestamp.Clock()
 	millisec := log.Timestamp.Nanosecond() / 1000000
 
-	return fmt.Sprintf("[%.4d/%.2d/%.2d %.2d:%.2d:%.2d.%.3d] [%v.%v] [%v:%v:%d] %v\n",
+	errorCodeStr := ""
+	if log.ErrorCode != NoErrorCode {
+		errorCodeStr += fmt.Sprintf("[%v] ", log.ErrorCode)
+	}
+
+	return fmt.Sprintf("[%.4d/%.2d/%.2d %.2d:%.2d:%.2d.%.3d] [%v.%v] [%v:%v:%d] %v%v\n",
 		year, month, day,
 		hour, min, sec,
 		millisec,
 		log.Prefix, log.Level.Type(),
 		log.Filename, log.FuncName, log.Line,
+		errorCodeStr,
 		log.Message())
 }
 
+type StringWriter interface {
+	WriteString(s string) (ret int, err error)
+	Sync() error
+}
+
 type FileAppender struct {
-	*os.File
+	StringWriter
 }
 
 func (self FileAppender) Append(log *Log) error {
